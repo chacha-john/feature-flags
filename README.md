@@ -27,11 +27,6 @@ The repository covers the whole path from laptop to production:
 
 ![Architecture diagram](docs/architecture.svg)
 
-Editable source: [`docs/architecture.drawio`](docs/architecture.drawio) (open it at
-[app.diagrams.net](https://app.diagrams.net) or in the draw.io desktop app). The SVG above was
-generated from the same layout; after editing in draw.io, re-export it with
-File > Export as > SVG to `docs/architecture.svg`.
-
 There are three flows to keep in mind:
 
 1. **Request path (production).** An internal client calls the internal Network Load Balancer, which

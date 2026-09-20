@@ -1,0 +1,353 @@
+# =============================================================================
+#  feature-flags: GitLab CI/CD pipeline
+#
+#  Merge request : lint -> test                       (nothing is built or shipped)
+#  Default branch: lint -> test -> build -> push -> deploy (MANUAL GATE)
+#                                                     rollback (MANUAL, on demand)
+#
+#  Assumptions:
+#    * Production is Kubernetes: one Deployment running one container.
+#    * Images are stored in an on-prem Harbor registry.
+#    * Runners can run Docker-in-Docker (privileged).
+#
+#  Create these under Settings > CI/CD > Variables. Never put them in this file:
+#    HARBOR_USERNAME  Harbor robot account with push rights on ONE project.
+#                     Robot names contain '$' (robot$name): untick "Expand variable
+#                     reference" or GitLab will mangle the value.              [protected]
+#    HARBOR_PASSWORD  The robot account secret.                       [masked, protected]
+#    K8S_TOKEN        ServiceAccount token, scope: environment "production".  [masked, protected]
+#    K8S_CA_FILE      Cluster CA certificate. Type: File, scope: production.   [protected]
+#
+#  "Protected" means the value is only exposed to protected branches, so a feature
+#  branch (or a malicious MR) can never read the registry or cluster credentials.
+#  Mark the default branch as protected for this to work.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# When does a pipeline exist at all?
+# Only for merge requests and for the default branch. A plain push to a feature
+# branch does nothing until an MR is opened, and an MR never produces two
+# duplicate pipelines (a branch pipeline AND an MR pipeline).
+# -----------------------------------------------------------------------------
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Stage order = execution order. "Lint and test" are two stages so the cheap
+# lint checks fail the pipeline before the slower test job starts.
+stages:
+  - lint
+  - test
+  - build
+  - push
+  - deploy
+  - rollback
+
+# -----------------------------------------------------------------------------
+# Placeholders. Replace with real values.
+# Everything here is non-secret; credentials come from CI/CD variables (see top).
+# -----------------------------------------------------------------------------
+variables:
+  # Harbor
+  HARBOR_REGISTRY: harbor.example.internal   # host[:port], no https://
+  HARBOR_PROJECT: my-project                 # Harbor project (namespace)
+  IMAGE_NAME: feature-flags
+  IMAGE_REPO: "$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME"
+
+  # The image is tagged with the commit that produced it. The full 40-char SHA is
+  # also stored inside the image as a label (see build:image), so it stays traceable
+  # while the tag stays short enough to read in `kubectl` output.
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+
+  # Tool images. On-prem runners usually can't reach Docker Hub, so these point at a
+  # Harbor "proxy cache" project (placeholder name below) that mirrors Docker Hub.
+  PROXY_CACHE: "$HARBOR_REGISTRY/dockerhub-proxy"
+  MAVEN_IMAGE: "$PROXY_CACHE/library/maven:3.9-eclipse-temurin-17"   # JDK 17 = pom java.version
+  DOCKER_IMAGE: "$PROXY_CACHE/library/docker:27-cli"
+  DIND_IMAGE: "$PROXY_CACHE/library/docker:27-dind"
+  HADOLINT_IMAGE: "$PROXY_CACHE/hadolint/hadolint:v2.12.0-debian"    # -debian variant has a shell
+  KUBECTL_IMAGE: "$HARBOR_REGISTRY/tools/kubectl:1.31"               # any image with kubectl + sh
+
+  # Production target
+  K8S_API_URL: https://k8s-api.prod.example.internal:6443
+  K8S_NAMESPACE: feature-flags
+  K8S_DEPLOYMENT: feature-flags
+  K8S_CONTAINER: app                                    # container name inside the Deployment
+  PROD_URL: https://feature-flags.prod.example.internal # shown on GitLab's Environments page
+
+
+# =============================================================================
+# Reusable templates (jobs starting with "." never run on their own)
+# =============================================================================
+
+# Maven jobs: JDK image plus a dependency cache.
+# The local repo is moved inside the project dir because GitLab can only cache
+# paths under $CI_PROJECT_DIR. The cache key is the hash of pom.xml, so it is reused
+# until dependencies actually change.
+# On-prem you likely also need a Nexus/Artifactory mirror of Maven Central: add a
+# settings.xml as a File-type CI/CD variable and pass it with `-s "$MAVEN_SETTINGS"`.
+# interruptible: a newer push to the same MR cancels the now-pointless older run.
+.maven:
+  image: $MAVEN_IMAGE
+  interruptible: true
+  variables:
+    MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+    MAVEN_CLI_OPTS: "-B -ntp"          # batch mode, no download-progress log spam
+  cache:
+    key:
+      files:
+        - pom.xml
+    paths:
+      - .m2/repository
+
+# Docker jobs: talk to a throw-away Docker daemon running as a sidecar service (DinD),
+# over TLS. The service alias MUST be "docker": with a mirrored image name GitLab
+# would otherwise derive a different hostname and DOCKER_HOST would not resolve.
+# Requirements: a privileged runner, and /certs/client shared between the job and the
+# service container (the docker executor needs it in `volumes`; the kubernetes executor
+# needs an emptyDir mounted there).
+# If Harbor uses an internal CA, the DinD service must trust it (custom dind image, or
+# mount the CA at /etc/docker/certs.d/<HARBOR_REGISTRY>/ca.crt). Do not "fix" this
+# with --insecure-registry.
+.docker:
+  image: $DOCKER_IMAGE
+  services:
+    - name: $DIND_IMAGE
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_CERT_PATH: "/certs/client"
+    DOCKER_TLS_VERIFY: "1"
+
+# kubectl jobs: build a kubeconfig from the variables above and point it at the
+# production cluster. The ServiceAccount behind K8S_TOKEN should be limited to the
+# one namespace and only the verbs needed (get/list/watch/patch on Deployments).
+# `entrypoint: [""]` because GitLab needs a plain shell, not kubectl, as the entrypoint.
+# Prefer the GitLab Agent for Kubernetes over a long-lived token if you run one.
+.kubectl:
+  image:
+    name: $KUBECTL_IMAGE
+    entrypoint: [""]
+  before_script:
+    - |
+      set -eu
+      kubectl config set-cluster production --server="$K8S_API_URL" --certificate-authority="$K8S_CA_FILE"
+      kubectl config set-credentials ci-deployer --token="$K8S_TOKEN"
+      kubectl config set-context production --cluster=production --user=ci-deployer --namespace="$K8S_NAMESPACE"
+      kubectl config use-context production
+
+# Only on the default branch (i.e. after a merge). Registry pushes and deployments
+# never originate from an unreviewed branch.
+.on-default-branch:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+
+# =============================================================================
+# STAGE 1a: LINT (every merge request and every default-branch pipeline)
+# =============================================================================
+
+# Dockerfile best-practice and shell checks. Fails on warnings and errors but not
+# on info-level style hints, so it blocks real problems without being nitpicky.
+lint:dockerfile:
+  stage: lint
+  interruptible: true
+  image:
+    name: $HADOLINT_IMAGE
+    entrypoint: [""]
+  script:
+    - hadolint --failure-threshold warning Dockerfile
+
+# Compile with warnings treated as errors, including deprecated-API usage. This is
+# what tells you early that a Spring Boot upgrade removed something you still call.
+# It needs no extra plugin config. When the team agrees a Checkstyle or SpotBugs
+# ruleset, add it here as another command.
+lint:java:
+  extends: .maven
+  stage: lint
+  script:
+    - >
+      mvn $MAVEN_CLI_OPTS -DskipTests compile
+      -Dmaven.compiler.showWarnings=true
+      -Dmaven.compiler.showDeprecation=true
+      -Dmaven.compiler.failOnWarning=true
+
+
+# =============================================================================
+# STAGE 1b: TEST (every merge request and every default-branch pipeline)
+# =============================================================================
+
+# Runs the unit and MockMvc tests. They use the in-memory store (no profile), so no
+# database is needed in CI. The JUnit XML is uploaded so GitLab shows pass/fail
+# counts directly in the merge request; `when: always` keeps it even when tests fail.
+test:unit:
+  extends: .maven
+  stage: test
+  script:
+    - mvn $MAVEN_CLI_OPTS test
+  artifacts:
+    when: always
+    reports:
+      junit: target/surefire-reports/TEST-*.xml
+
+
+# =============================================================================
+# STAGE 2: BUILD the image and tag it with the commit SHA
+# =============================================================================
+
+# Builds and saves the image, but does NOT publish it. Build and push are separate
+# stages on purpose: a vulnerability scan or signing job can be inserted between them
+# so nothing reaches Harbor unless it passes.
+#
+# Tests are skipped inside the Dockerfile build; they already ran in the test stage.
+# --pull refreshes the base images so security patches are picked up.
+# The image travels to the next stage as a compressed tarball artifact.
+
+build:image:
+  extends: [.docker, .on-default-branch]
+  stage: build
+  dependencies: []            # don't download the test reports; not needed here
+  script:
+    - |
+      set -eu
+      docker build --pull \
+        --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+        --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
+        --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --tag "$IMAGE_REPO:$IMAGE_TAG" \
+        .
+      docker save --output image.tar "$IMAGE_REPO:$IMAGE_TAG"
+      gzip -1 image.tar
+  artifacts:
+    paths:
+      - image.tar.gz
+    expire_in: 2 hours        # only a hand-off to the push job; Harbor is the real store
+
+
+# =============================================================================
+# STAGE 3: PUSH to Harbor
+# =============================================================================
+
+# Only the SHA tag is pushed. There is deliberately no "latest": a moving tag makes it
+# impossible to tell what is running or what "previous" means. In Harbor, also enable
+# tag immutability for this project so a SHA tag can never be overwritten, and set a
+# retention rule that keeps enough recent tags, because rollback needs the previous
+# image to still exist.
+push:image:
+  extends: [.docker, .on-default-branch]
+  stage: push
+  needs:
+    - build:image             # fetch only the image tarball
+  script:
+    - |
+      set -eu
+      docker load --input image.tar.gz
+      echo "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" --username "$HARBOR_USERNAME" --password-stdin
+      docker push "$IMAGE_REPO:$IMAGE_TAG"
+      docker logout "$HARBOR_REGISTRY"
+
+
+# =============================================================================
+# STAGE 4: DEPLOY to production behind a MANUAL APPROVAL GATE
+# =============================================================================
+
+# `when: manual` + `allow_failure: false` is the gate: the pipeline stops here and
+# shows as "blocked" until a person presses Play. Nothing reaches production
+# automatically.
+#
+# Who may press Play is controlled by GitLab, not by this file:
+#   * Settings > CI/CD > Protected environments > production: restrict "allowed to
+#     deploy" to release group.
+#   * Premium/Ultimate: set "Required approvals" on that protected environment for a
+#     real four-eyes rule (the deployer cannot approve their own deployment).
+#
+# resource_group makes production deployments and rollbacks run one at a time.
+# timeout stops a hung job from holding that lock forever.
+#
+# Before switching the image, the currently running image is stored on the Deployment
+# as the annotation "previous-image". That annotation is what the rollback job reads,
+# so rollback works from any pipeline and needs no GitLab API token.
+
+deploy:production:
+  extends: .kubectl
+  stage: deploy
+  needs:
+    - push:image
+  resource_group: production
+  timeout: 15m
+  environment:
+    name: production
+    url: $PROD_URL
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+  script:
+    - |
+      set -eu
+      NEW_IMAGE="$IMAGE_REPO:$IMAGE_TAG"
+      CURRENT_IMAGE=$(kubectl get deployment "$K8S_DEPLOYMENT" -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+      echo "Currently running: $CURRENT_IMAGE"
+      echo "Deploying        : $NEW_IMAGE"
+
+      # Skip when re-running a deploy of the same tag. Otherwise "previous" would be
+      # overwritten with the current image and rollback would become a no-op.
+      if [ "$CURRENT_IMAGE" != "$NEW_IMAGE" ]; then
+        kubectl annotate deployment "$K8S_DEPLOYMENT" "previous-image=$CURRENT_IMAGE" --overwrite
+      fi
+
+      kubectl set image "deployment/$K8S_DEPLOYMENT" "$K8S_CONTAINER=$NEW_IMAGE"
+
+      # Fails the job if the new pods don't become ready in time (readiness probe).
+      kubectl rollout status "deployment/$K8S_DEPLOYMENT" --timeout=300s
+
+
+# =============================================================================
+# STAGE 5: ROLLBACK, redeploy the previous image when triggered
+# =============================================================================
+
+# Manual and always available on default-branch pipelines. `needs: []` lets it start
+# without waiting for earlier stages, so during an incident you can press it from any
+# pipeline, even one that never deployed.
+#
+# It redeploys the image recorded by the last deploy job ("undo the last deploy").
+# The next normal deploy records the rolled-back image as its "previous" again.
+#
+# environment action "access": GitLab records no new deployment, so the current commit
+# is not falsely shown as the version live in production.
+rollback:production:
+  extends: .kubectl
+  stage: rollback
+  needs: []
+  resource_group: production
+  timeout: 15m
+  environment:
+    name: production
+    url: $PROD_URL
+    action: access
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true     # optional job; must not leave the pipeline "blocked"
+  script:
+    - |
+      set -eu
+      CURRENT_IMAGE=$(kubectl get deployment "$K8S_DEPLOYMENT" -o jsonpath='{.spec.template.spec.containers[0].image}')
+      PREVIOUS_IMAGE=$(kubectl get deployment "$K8S_DEPLOYMENT" -o jsonpath='{.metadata.annotations.previous-image}')
+
+      if [ -z "$PREVIOUS_IMAGE" ]; then
+        echo "ERROR: no previous image recorded on the Deployment. Nothing to roll back to." >&2
+        exit 1
+      fi
+
+      if [ "$PREVIOUS_IMAGE" = "$CURRENT_IMAGE" ]; then
+        echo "Already running the previous image ($CURRENT_IMAGE). Nothing to do."
+        exit 0
+      fi
+
+      echo "Rolling back: $CURRENT_IMAGE -> $PREVIOUS_IMAGE"
+      kubectl set image "deployment/$K8S_DEPLOYMENT" "$K8S_CONTAINER=$PREVIOUS_IMAGE"
+      kubectl rollout status "deployment/$K8S_DEPLOYMENT" --timeout=300s

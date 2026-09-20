@@ -6,7 +6,7 @@ metadata:
   name: feature-flags
   namespace: feature-flags
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: feature-flags

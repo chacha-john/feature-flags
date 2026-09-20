@@ -1,0 +1,77 @@
+# Initial Deployment + Service. After this exists, the GitLab pipeline only swaps the image
+# (container name `app` matches K8S_CONTAINER in .gitlab-ci.yml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feature-flags
+  namespace: feature-flags
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: feature-flags
+  template:
+    metadata:
+      labels:
+        app: feature-flags
+    spec:
+      serviceAccountName: feature-flags
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: harbor-pull # docker-registry secret for Harbor, created out-of-band
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: ${IMAGE}
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: feature-flags-config # profile + JDBC URL (from Terraform)
+            - secretRef:
+                name: feature-flags-db # username + password (synced from Secrets Manager)
+          readinessProbe:
+            httpGet: { path: /flags, port: 8080 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /flags, port: 8080 }
+            initialDelaySeconds: 40
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { memory: 768Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# Internal network load balancer (private subnets). The API has no authentication, so it is not
+# exposed to the internet by default. Remove the `internal` annotation only after adding authN.
+apiVersion: v1
+kind: Service
+metadata:
+  name: feature-flags
+  namespace: feature-flags
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  selector:
+    app: feature-flags
+  ports:
+    - port: 80
+      targetPort: 8080

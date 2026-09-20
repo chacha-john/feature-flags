@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars (git-ignored) and adjust. No secrets belong in this file.
+
+region      = "eu-west-1"
+environment = "prod"
+
+# Required. Egress IPs that may reach the public EKS API: your VPN/office and the GitLab runners.
+cluster_public_access_cidrs = ["203.0.113.10/32"]
+
+# Optional. Extra IAM roles/users that get cluster-admin via EKS access entries.
+admin_principal_arns = []
+
+# Cheaper non-production settings:
+# single_nat_gateway     = true
+# db_multi_az            = false
+# db_deletion_protection = false

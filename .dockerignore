@@ -10,3 +10,4 @@ docker-compose.yml
 nginx/
 README.md
 terraform/
+docs/
